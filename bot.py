@@ -18,6 +18,7 @@ WEB_APP_URL       = os.environ.get("WEB_APP_URL", "https://mirrrr.vercel.app")
 PORT              = int(os.environ.get("PORT", 8080))
 DB_PATH           = os.environ.get("DB_PATH", "users.db")
 XAI_MODEL         = os.environ.get("XAI_MODEL", "grok-4.20-0309-reasoning")
+OCR_MODEL         = os.environ.get("OCR_MODEL", XAI_MODEL)
 ENABLE_KEEPALIVE  = os.environ.get("ENABLE_KEEPALIVE", "true").lower() == "true"
 YUKASSA_SHOP_ID   = os.environ.get("YUKASSA_SHOP_ID", "")
 YUKASSA_SECRET    = os.environ.get("YUKASSA_SECRET", "")
@@ -169,6 +170,17 @@ PROMPTS = {
 Теперь проверь следующее сочинение:\n\n`"""
 }
 
+OCR_PROMPT = """Ты — система оптического распознавания рукописного текста (OCR).
+Твоя задача: точно перевести рукописный текст с фотографии в печатный вид.
+
+ПРАВИЛА:
+- Переводи ТОЛЬКО тот текст, который видишь на фото
+- Не добавляй ничего от себя и не исправляй содержание
+- Сохраняй структуру и абзацы как в оригинале
+- Не исправляй орфографию и грамматику — переводи буква в букву
+- Если слово неразборчиво — напиши наиболее вероятный вариант и добавь [?]
+- Выведи ТОЛЬКО распознанный текст, без заголовков и комментариев"""
+
 
 # ── База данных ──
 
@@ -316,7 +328,8 @@ def get_user_by_token(token):
     """Проверяет токен и возвращает user_id, не сжигая его."""
     with get_db() as con:
         row = con.execute(
-            "SELECT user_id, used, created_at FROM tokens WHERE token=?", (token,)
+            "SELECT user_id, used, created_at FROM tokens WHERE token=?",
+            (token,)
         ).fetchone()
     if not row:
         return None
@@ -708,6 +721,71 @@ async def handle_check_token(request):
     return web.json_response({"ok": valid}, headers=CORS_HEADERS)
 
 
+async def handle_ocr(request):
+    """Распознаёт рукописный текст с фото. Токен проверяется, но не сжигается."""
+    if request.method == "OPTIONS":
+        return web.Response(status=200, headers=CORS_HEADERS)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "bad json"}, status=400, headers=CORS_HEADERS)
+
+    token = body.get("token", "")
+    photo = body.get("photo", "")
+
+    user_id = get_user_by_token(token)
+    if not user_id:
+        return web.json_response({"error": "invalid_token"}, status=403, headers=CORS_HEADERS)
+
+    if not photo or not isinstance(photo, str) or not photo.startswith("data:image/"):
+        return web.json_response({"error": "Необходимо предоставить фото"}, status=400, headers=CORS_HEADERS)
+
+    try:
+        async with xai_semaphore:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.x.ai/v1/chat/completions",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {GROK_API_KEY}"
+                    },
+                    json={
+                        "model": OCR_MODEL,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image_url", "image_url": {"url": photo}},
+                                    {"type": "text", "text": OCR_PROMPT}
+                                ]
+                            }
+                        ]
+                    },
+                    timeout=aiohttp.ClientTimeout(total=60)
+                ) as resp:
+                    if resp.status != 200:
+                        err = await resp.text()
+                        return web.json_response(
+                            {"error": f"Ошибка распознавания: {err[:200]}"}, status=502, headers=CORS_HEADERS
+                        )
+                    data = await resp.json()
+                    choices = data.get("choices")
+                    if not choices:
+                        return web.json_response(
+                            {"error": "Не удалось распознать текст"}, status=502, headers=CORS_HEADERS
+                        )
+                    recognized = choices[0].get("message", {}).get("content", "").strip()
+                    if not recognized:
+                        return web.json_response(
+                            {"error": "Не удалось распознать текст на фото"}, status=502, headers=CORS_HEADERS
+                        )
+                    return web.json_response({"text": recognized}, headers=CORS_HEADERS)
+    except asyncio.TimeoutError:
+        return web.json_response({"error": "Таймаут распознавания"}, status=504, headers=CORS_HEADERS)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500, headers=CORS_HEADERS)
+
+
 def _decode_data_url(data_url):
     """Возвращает (mime, bytes) из data URL."""
     import base64
@@ -943,11 +1021,13 @@ async def handle_yukassa_webhook(request):
 
 async def run_web():
     app = web.Application()
-    app.router.add_get("/check_token",       handle_check_token)
+    app.router.add_get("/check_token",        handle_check_token)
     app.router.add_route("OPTIONS", "/check_token", handle_check_token)
-    app.router.add_post("/proxy",            handle_proxy)
+    app.router.add_post("/ocr",               handle_ocr)
+    app.router.add_route("OPTIONS", "/ocr",   handle_ocr)
+    app.router.add_post("/proxy",             handle_proxy)
     app.router.add_route("OPTIONS", "/proxy", handle_proxy)
-    app.router.add_post("/yukassa/webhook",  handle_yukassa_webhook)
+    app.router.add_post("/yukassa/webhook",   handle_yukassa_webhook)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
