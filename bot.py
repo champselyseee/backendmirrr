@@ -4,7 +4,7 @@ from telegram import (Update, ReplyKeyboardMarkup, ReplyKeyboardRemove,
 from telegram.ext import (ApplicationBuilder, CommandHandler, ContextTypes,
                            PreCheckoutQueryHandler, MessageHandler, filters,
                            CallbackQueryHandler)
-import sqlite3, secrets, time, asyncio, os, uuid
+import sqlite3, secrets, time, asyncio, os, uuid, json
 from contextlib import contextmanager
 import aiohttp
 from aiohttp import web
@@ -84,6 +84,70 @@ def _extract_text(data: dict) -> str:
     return "".join(
         b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"
     ).strip()
+
+
+# ── Структурированный результат проверки (Anthropic structured outputs) ──
+# Модель возвращает строго этот JSON: текст работы как сегменты с тегом типа
+# ошибки + критерии с баллами. Фронт рендерит подсветку и карточки критериев.
+RESULT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "integer"},
+        "max_score": {"type": "integer"},
+        "segments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "t": {"type": "string"},
+                    "e": {
+                        "type": "string",
+                        "enum": [
+                            "none", "spelling", "punctuation", "grammar",
+                            "speech", "factual", "logical", "recommendation",
+                        ],
+                    },
+                },
+                "required": ["t", "e"],
+                "additionalProperties": False,
+            },
+        },
+        "criteria": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string"},
+                    "score": {"type": "integer"},
+                    "max": {"type": "integer"},
+                    "errors": {"type": "integer"},
+                    "comment": {"type": "string"},
+                },
+                "required": ["code", "score", "max", "errors", "comment"],
+                "additionalProperties": False,
+            },
+        },
+        "summary": {"type": "string"},
+    },
+    "required": ["score", "max_score", "segments", "criteria", "summary"],
+    "additionalProperties": False,
+}
+
+# Добавляется в конец каждого промпта (перед строкой «Теперь оцени…»).
+FORMAT_BLOCK = """
+
+=== ФОРМАТ ОТВЕТА (СТРОГО JSON ПО СХЕМЕ) ===
+Верни результат ТОЛЬКО как JSON по навязанной схеме. Никакого текста вне JSON.
+
+• "segments" — массив фрагментов ТЕКСТА РАБОТЫ строго по порядку. Конкатенация всех "t" должна ДОСЛОВНО совпадать с исходным текстом работы: ничего не переписывай, не исправляй, не добавляй и не выбрасывай. Фрагмент с ошибкой выдели ОТДЕЛЬНЫМ элементом и поставь "e" = тип; обычный текст между ошибками отдавай крупными кусками с "e":"none". Выделяй минимально необходимый фрагмент (слово или словосочетание).
+  Значения "e": "spelling" — орфографическая, "punctuation" — пунктуационная, "grammar" — грамматическая, "speech" — речевая/лексическая, "factual" — фактическая, "logical" — логическая, "recommendation" — стилистическая рекомендация (совет, не ошибка). "none" — фрагмент без ошибок.
+• "criteria" — по КАЖДОМУ критерию этого задания (К1, К2, … из шкалы выше): "code" (например "К1"), "score", "max" (по шкале выше), "errors" (число ошибок, повлиявших на этот балл; 0 если нет), "comment" — одно короткое предложение, за что снят или сохранён балл.
+• "score" — итоговый балл; "max_score" — максимум этого задания.
+• "summary" — кратко: что сделано хорошо; 3 главные причины потери баллов; что конкретно сделать, чтобы выйти на максимум.
+
+Если текста работы нет или он не по заданию — "segments" пустой массив, все критерии 0, причину объясни в "summary".
+
+"""
 
 PROMPTS = {
     "email": """Ты — официальный эксперт предметной комиссии ЕГЭ по английскому языку 2026 года (письменная часть), прошедший обучение по «Методическим материалам» ФИПИ (Вербицкая М.В. и др.).
@@ -213,6 +277,16 @@ PROMPTS = {
 
 Теперь проверь следующее сочинение:\n\n`"""
 }
+
+# Дописываем единый блок формата ответа в конец каждого промпта (перед строкой
+# «Теперь оцени…»), чтобы не дублировать инструкции в трёх местах.
+_PROMPT_CLOSERS = {
+    "email": "Теперь оцени это письмо:",
+    "essay": "Теперь оцени эту работу:",
+    "composition": "Теперь проверь следующее сочинение:",
+}
+for _k, _closer in _PROMPT_CLOSERS.items():
+    PROMPTS[_k] = PROMPTS[_k].replace(_closer, FORMAT_BLOCK + _closer, 1)
 
 OCR_PROMPT = """Ты — система оптического распознавания рукописного текста (OCR).
 Твоя задача: точно перевести рукописный текст с фотографии в печатный вид.
@@ -620,10 +694,18 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dt = datetime.fromtimestamp(created_at).strftime("%d.%m %H:%M")
         tname = type_names.get(work_type, work_type)
         preview = ""
-        for line in result.splitlines():
-            if _re.search(r"ИТОГ|итог|\d+\s*/\s*\d+|\d+\s+баллов", line):
-                preview = line.strip()[:120]
-                break
+        # Новый формат — JSON со score/max_score: показываем чистый балл.
+        try:
+            _d = json.loads(result)
+            if isinstance(_d, dict) and "score" in _d and "max_score" in _d:
+                preview = f"Балл: {_d['score']}/{_d['max_score']}"
+        except Exception:
+            pass
+        if not preview:
+            for line in result.splitlines():
+                if _re.search(r"ИТОГ|итог|\d+\s*/\s*\d+|\d+\s+баллов", line):
+                    preview = line.strip()[:120]
+                    break
         if not preview:
             preview = result.splitlines()[0][:120] if result else ""
         text += f"{i}. {tname} — {dt}\n{preview}\n\n"
@@ -1005,6 +1087,8 @@ async def handle_proxy(request):
     }
     if THINKING_MODE == "adaptive":
         payload["thinking"] = {"type": "adaptive"}
+    # Структурированный вывод: модель обязана вернуть JSON по RESULT_SCHEMA.
+    payload["output_config"] = {"format": {"type": "json_schema", "schema": RESULT_SCHEMA}}
 
     try:
         async with ai_semaphore:
