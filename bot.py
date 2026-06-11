@@ -14,7 +14,7 @@ load_dotenv()
 
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-WEB_APP_URL       = os.environ.get("WEB_APP_URL", "https://mirrrr.vercel.app")
+WEB_APP_URL       = os.environ.get("WEB_APP_URL", "https://botupdatedront-8vax.vercel.app")
 PORT              = int(os.environ.get("PORT", 8080))
 DB_PATH           = os.environ.get("DB_PATH", "users.db")
 TRAINING_DB_PATH  = os.environ.get("TRAINING_DB_PATH", "training.db")
