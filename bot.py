@@ -8,6 +8,8 @@ import sqlite3, secrets, time, asyncio, os, uuid, json
 from contextlib import contextmanager
 import aiohttp
 from aiohttp import web
+import anthropic
+from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,8 +22,6 @@ DB_PATH           = os.environ.get("DB_PATH", "users.db")
 TRAINING_DB_PATH  = os.environ.get("TRAINING_DB_PATH", "training.db")
 
 # ── Anthropic (Claude) ──
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_VERSION = "2023-06-01"
 MODEL             = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8")
 OCR_MODEL         = os.environ.get("OCR_MODEL", MODEL)
 MAX_TOKENS        = int(os.environ.get("MAX_TOKENS", "16000"))       # лимит вывода для проверки работ
@@ -50,16 +50,12 @@ CORS_HEADERS = {
 
 ai_semaphore = asyncio.Semaphore(10)
 
+# Единый асинхронный клиент Anthropic. Сам ретраит 429/5xx/overloaded с
+# экспоненциальным бэкоффом (max_retries) — раньше ретраев не было вообще.
+anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY, max_retries=3)
+
 
 # ── Anthropic helpers ──
-
-def _anthropic_headers():
-    return {
-        "content-type":      "application/json",
-        "x-api-key":         ANTHROPIC_API_KEY,
-        "anthropic-version": ANTHROPIC_VERSION,
-    }
-
 
 def _image_block(data_url: str) -> dict:
     """data:image/png;base64,XXXX → image-блок Anthropic Messages API.
@@ -75,14 +71,14 @@ def _image_block(data_url: str) -> dict:
     }
 
 
-def _extract_text(data: dict) -> str:
-    """Собирает текст из content-блоков ответа Anthropic.
+def _extract_text(message) -> str:
+    """Собирает текст из content-блоков ответа Anthropic SDK.
 
-    В ответе content — список блоков; берём только type == 'text'
+    message.content — список блоков; берём только type == 'text'
     (блоки thinking, если включено адаптивное мышление, игнорируем).
     """
     return "".join(
-        b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"
+        b.text for b in message.content if getattr(b, "type", None) == "text"
     ).strip()
 
 
@@ -896,39 +892,32 @@ async def handle_ocr(request):
 
     try:
         async with ai_semaphore:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    ANTHROPIC_API_URL,
-                    headers=_anthropic_headers(),
-                    json={
-                        "model": OCR_MODEL,
-                        "max_tokens": OCR_MAX_TOKENS,
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    _image_block(photo),
-                                    {"type": "text", "text": OCR_PROMPT}
-                                ]
-                            }
-                        ]
-                    },
-                    timeout=aiohttp.ClientTimeout(total=60)
-                ) as resp:
-                    if resp.status != 200:
-                        err = await resp.text()
-                        return web.json_response(
-                            {"error": f"Ошибка распознавания: {err[:200]}"}, status=502, headers=CORS_HEADERS
-                        )
-                    data = await resp.json()
-                    recognized = _extract_text(data)
-                    if not recognized:
-                        return web.json_response(
-                            {"error": "Не удалось распознать текст на фото"}, status=502, headers=CORS_HEADERS
-                        )
-                    return web.json_response({"text": recognized}, headers=CORS_HEADERS)
-    except asyncio.TimeoutError:
+            message = await anthropic_client.messages.create(
+                model=OCR_MODEL,
+                max_tokens=OCR_MAX_TOKENS,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            _image_block(photo),
+                            {"type": "text", "text": OCR_PROMPT},
+                        ],
+                    }
+                ],
+                timeout=60,
+            )
+        recognized = _extract_text(message)
+        if not recognized:
+            return web.json_response(
+                {"error": "Не удалось распознать текст на фото"}, status=502, headers=CORS_HEADERS
+            )
+        return web.json_response({"text": recognized}, headers=CORS_HEADERS)
+    except anthropic.APITimeoutError:
         return web.json_response({"error": "Таймаут распознавания"}, status=504, headers=CORS_HEADERS)
+    except anthropic.APIStatusError as e:
+        return web.json_response(
+            {"error": f"Ошибка распознавания: {str(e)[:200]}"}, status=502, headers=CORS_HEADERS
+        )
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500, headers=CORS_HEADERS)
 
@@ -1077,48 +1066,47 @@ async def handle_proxy(request):
     else:
         user_content = prompt + combined_text
 
-    payload = {
+    create_kwargs = {
         "model": MODEL,
         "max_tokens": MAX_TOKENS,
         "system": "Ты опытный преподаватель, проверяющий работы по ЕГЭ. Отвечай структурированно и по делу.",
         "messages": [
             {"role": "user", "content": user_content}
         ],
+        # Структурированный вывод: модель обязана вернуть JSON по RESULT_SCHEMA.
+        "output_config": {"format": {"type": "json_schema", "schema": RESULT_SCHEMA}},
+        # При стриминге (см. ниже) это таймаут чтения одного чанка, а не всей
+        # генерации, — долгий ответ с adaptive thinking не обрывается по нему.
+        "timeout": 300,
     }
     if THINKING_MODE == "adaptive":
-        payload["thinking"] = {"type": "adaptive"}
-    # Структурированный вывод: модель обязана вернуть JSON по RESULT_SCHEMA.
-    payload["output_config"] = {"format": {"type": "json_schema", "schema": RESULT_SCHEMA}}
+        create_kwargs["thinking"] = {"type": "adaptive"}
 
     try:
         async with ai_semaphore:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    ANTHROPIC_API_URL,
-                    headers=_anthropic_headers(),
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=300)
-                ) as resp:
-                    if resp.status != 200:
-                        err = await resp.text()
-                        return web.json_response(
-                            {"error": f"Anthropic error: {err[:200]}"}, status=502, headers=CORS_HEADERS
-                        )
-                    data = await resp.json()
-                    if data.get("stop_reason") == "refusal":
-                        return web.json_response(
-                            {"error": "Модель отклонила запрос"}, status=502, headers=CORS_HEADERS
-                        )
-                    answer = _extract_text(data)
-                    if not answer:
-                        return web.json_response(
-                            {"error": "ИИ вернул пустой ответ"}, status=502, headers=CORS_HEADERS
-                        )
-                    save_history(user_id, work_type, answer)
-                    asyncio.create_task(_send_new_token(user_id))
-                    return web.json_response({"answer": answer}, headers=CORS_HEADERS)
-    except asyncio.TimeoutError:
+            # Стримим: соединение держится живым на время длинной генерации
+            # (16k токенов + adaptive thinking), поэтому таймаут чтения не рвёт
+            # ответ и SDK не ретраит дорогую генерацию по таймауту.
+            async with anthropic_client.messages.stream(**create_kwargs) as stream:
+                message = await stream.get_final_message()
+        if message.stop_reason == "refusal":
+            return web.json_response(
+                {"error": "Модель отклонила запрос"}, status=502, headers=CORS_HEADERS
+            )
+        answer = _extract_text(message)
+        if not answer:
+            return web.json_response(
+                {"error": "ИИ вернул пустой ответ"}, status=502, headers=CORS_HEADERS
+            )
+        save_history(user_id, work_type, answer)
+        asyncio.create_task(_send_new_token(user_id))
+        return web.json_response({"answer": answer}, headers=CORS_HEADERS)
+    except anthropic.APITimeoutError:
         return web.json_response({"error": "Таймаут ответа от ИИ"}, status=504, headers=CORS_HEADERS)
+    except anthropic.APIStatusError as e:
+        return web.json_response(
+            {"error": f"Anthropic error: {str(e)[:200]}"}, status=502, headers=CORS_HEADERS
+        )
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500, headers=CORS_HEADERS)
 
