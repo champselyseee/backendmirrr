@@ -13,11 +13,22 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
-GROK_API_KEY      = os.environ.get("GROK_API_KEY")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 WEB_APP_URL       = os.environ.get("WEB_APP_URL", "https://mirrrr.vercel.app")
 PORT              = int(os.environ.get("PORT", 8080))
 DB_PATH           = os.environ.get("DB_PATH", "users.db")
-XAI_MODEL         = os.environ.get("XAI_MODEL", "grok-4.20-0309-reasoning")
+TRAINING_DB_PATH  = os.environ.get("TRAINING_DB_PATH", "training.db")
+
+# ── Anthropic (Claude) ──
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+MODEL             = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8")
+OCR_MODEL         = os.environ.get("OCR_MODEL", MODEL)
+MAX_TOKENS        = int(os.environ.get("MAX_TOKENS", "16000"))       # лимит вывода для проверки работ
+OCR_MAX_TOKENS    = int(os.environ.get("OCR_MAX_TOKENS", "4000"))    # лимит вывода для распознавания фото
+# Адаптивное мышление для проверки работ (рассуждающая задача). "off" — выключить.
+THINKING_MODE     = os.environ.get("THINKING_MODE", "adaptive")
+
 ENABLE_KEEPALIVE  = os.environ.get("ENABLE_KEEPALIVE", "true").lower() == "true"
 YUKASSA_SHOP_ID   = os.environ.get("YUKASSA_SHOP_ID", "")
 YUKASSA_SECRET    = os.environ.get("YUKASSA_SECRET", "")
@@ -37,8 +48,42 @@ CORS_HEADERS = {
     "Access-Control-Allow-Headers": "Content-Type",
 }
 
-# Семафор — не более 10 одновременных запросов к xAI
-xai_semaphore = asyncio.Semaphore(10)
+ai_semaphore = asyncio.Semaphore(10)
+
+
+# ── Anthropic helpers ──
+
+def _anthropic_headers():
+    return {
+        "content-type":      "application/json",
+        "x-api-key":         ANTHROPIC_API_KEY,
+        "anthropic-version": ANTHROPIC_VERSION,
+    }
+
+
+def _image_block(data_url: str) -> dict:
+    """data:image/png;base64,XXXX → image-блок Anthropic Messages API.
+
+    OpenAI/Grok принимали data-URL целиком в image_url. Anthropic требует
+    разбить его на media_type + чистый base64.
+    """
+    header, b64 = data_url.split(",", 1)
+    media_type = header[5:].split(";", 1)[0] or "image/jpeg"  # отрезаем 'data:'
+    return {
+        "type": "image",
+        "source": {"type": "base64", "media_type": media_type, "data": b64},
+    }
+
+
+def _extract_text(data: dict) -> str:
+    """Собирает текст из content-блоков ответа Anthropic.
+
+    В ответе content — список блоков; берём только type == 'text'
+    (блоки thinking, если включено адаптивное мышление, игнорируем).
+    """
+    return "".join(
+        b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"
+    ).strip()
 
 PROMPTS = {
     "email": """Ты — официальный эксперт предметной комиссии ЕГЭ по английскому языку 2026 года (письменная часть), прошедший обучение по «Методическим материалам» ФИПИ (Вербицкая М.В. и др.).
@@ -168,6 +213,17 @@ PROMPTS = {
 
 Теперь проверь следующее сочинение:\n\n`"""
 }
+
+OCR_PROMPT = """Ты — система оптического распознавания рукописного текста (OCR).
+Твоя задача: точно перевести рукописный текст с фотографии в печатный вид.
+
+ПРАВИЛА:
+- Переводи ТОЛЬКО тот текст, который видишь на фото
+- Не добавляй ничего от себя и не исправляй содержание
+- Сохраняй структуру и абзацы как в оригинале
+- Не исправляй орфографию и грамматику — переводи буква в букву
+- Если слово неразборчиво — напиши наиболее вероятный вариант и добавь [?]
+- Выведи ТОЛЬКО распознанный текст, без заголовков и комментариев"""
 
 
 # ── База данных ──
@@ -316,7 +372,8 @@ def get_user_by_token(token):
     """Проверяет токен и возвращает user_id, не сжигая его."""
     with get_db() as con:
         row = con.execute(
-            "SELECT user_id, used, created_at FROM tokens WHERE token=?", (token,)
+            "SELECT user_id, used, created_at FROM tokens WHERE token=?",
+            (token,)
         ).fetchone()
     if not row:
         return None
@@ -372,6 +429,34 @@ def get_history(user_id, limit=5):
             (user_id, limit)
         ).fetchall()
     return rows
+
+
+# DATA COLLECTION: отдельная БД для датасета дообучения
+def init_training_db():
+    db_dir = os.path.dirname(TRAINING_DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+    con = sqlite3.connect(TRAINING_DB_PATH, timeout=10)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("""CREATE TABLE IF NOT EXISTS training_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_type TEXT,
+        input_text TEXT,
+        created_at INTEGER)""")
+    con.commit()
+    con.close()
+
+
+def save_training_sample(work_type, input_text):
+    con = sqlite3.connect(TRAINING_DB_PATH, timeout=10)
+    try:
+        con.execute(
+            "INSERT INTO training_data (work_type, input_text, created_at) VALUES (?,?,?)",
+            (work_type, input_text, int(time.time()))
+        )
+        con.commit()
+    finally:
+        con.close()
 
 
 def is_whitelisted(username):
@@ -708,6 +793,64 @@ async def handle_check_token(request):
     return web.json_response({"ok": valid}, headers=CORS_HEADERS)
 
 
+async def handle_ocr(request):
+    """Распознаёт рукописный текст с фото. Токен проверяется, но не сжигается."""
+    if request.method == "OPTIONS":
+        return web.Response(status=200, headers=CORS_HEADERS)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "bad json"}, status=400, headers=CORS_HEADERS)
+
+    token = body.get("token", "")
+    photo = body.get("photo", "")
+
+    user_id = get_user_by_token(token)
+    if not user_id:
+        return web.json_response({"error": "invalid_token"}, status=403, headers=CORS_HEADERS)
+
+    if not photo or not isinstance(photo, str) or not photo.startswith("data:image/"):
+        return web.json_response({"error": "Необходимо предоставить фото"}, status=400, headers=CORS_HEADERS)
+
+    try:
+        async with ai_semaphore:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    ANTHROPIC_API_URL,
+                    headers=_anthropic_headers(),
+                    json={
+                        "model": OCR_MODEL,
+                        "max_tokens": OCR_MAX_TOKENS,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    _image_block(photo),
+                                    {"type": "text", "text": OCR_PROMPT}
+                                ]
+                            }
+                        ]
+                    },
+                    timeout=aiohttp.ClientTimeout(total=60)
+                ) as resp:
+                    if resp.status != 200:
+                        err = await resp.text()
+                        return web.json_response(
+                            {"error": f"Ошибка распознавания: {err[:200]}"}, status=502, headers=CORS_HEADERS
+                        )
+                    data = await resp.json()
+                    recognized = _extract_text(data)
+                    if not recognized:
+                        return web.json_response(
+                            {"error": "Не удалось распознать текст на фото"}, status=502, headers=CORS_HEADERS
+                        )
+                    return web.json_response({"text": recognized}, headers=CORS_HEADERS)
+    except asyncio.TimeoutError:
+        return web.json_response({"error": "Таймаут распознавания"}, status=504, headers=CORS_HEADERS)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500, headers=CORS_HEADERS)
+
+
 def _decode_data_url(data_url):
     """Возвращает (mime, bytes) из data URL."""
     import base64
@@ -837,8 +980,14 @@ async def handle_proxy(request):
     if len(combined_text) > 60000:
         combined_text = combined_text[:60000] + "\n\n[Текст был обрезан до 60000 символов.]"
 
+    # DATA COLLECTION: сохраняем работу ученика до отправки в xAI
+    try:
+        save_training_sample(work_type, combined_text)
+    except Exception:
+        pass
+
     if photos:
-        user_content = [{"type": "image_url", "image_url": {"url": p}} for p in photos]
+        user_content = [_image_block(p) for p in photos]
         user_content.append({
             "type": "text",
             "text": "Вот фото/файл задания и текст работы.\n\n" + prompt + combined_text
@@ -846,42 +995,40 @@ async def handle_proxy(request):
     else:
         user_content = prompt + combined_text
 
+    payload = {
+        "model": MODEL,
+        "max_tokens": MAX_TOKENS,
+        "system": "Ты опытный преподаватель, проверяющий работы по ЕГЭ. Отвечай структурированно и по делу.",
+        "messages": [
+            {"role": "user", "content": user_content}
+        ],
+    }
+    if THINKING_MODE == "adaptive":
+        payload["thinking"] = {"type": "adaptive"}
+
     try:
-        async with xai_semaphore:
+        async with ai_semaphore:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    "https://api.x.ai/v1/chat/completions",
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {GROK_API_KEY}"
-                    },
-                    json={
-                        "model": XAI_MODEL,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": "Ты опытный преподаватель, проверяющий работы по ЕГЭ. Отвечай структурированно и по делу."
-                            },
-                            {"role": "user", "content": user_content}
-                        ]
-                    },
+                    ANTHROPIC_API_URL,
+                    headers=_anthropic_headers(),
+                    json=payload,
                     timeout=aiohttp.ClientTimeout(total=300)
                 ) as resp:
                     if resp.status != 200:
                         err = await resp.text()
                         return web.json_response(
-                            {"error": f"xAI error: {err[:200]}"}, status=502, headers=CORS_HEADERS
+                            {"error": f"Anthropic error: {err[:200]}"}, status=502, headers=CORS_HEADERS
                         )
                     data = await resp.json()
-                    choices = data.get("choices")
-                    if not choices or not isinstance(choices, list):
+                    if data.get("stop_reason") == "refusal":
                         return web.json_response(
-                            {"error": "xAI вернул пустой ответ"}, status=502, headers=CORS_HEADERS
+                            {"error": "Модель отклонила запрос"}, status=502, headers=CORS_HEADERS
                         )
-                    answer = choices[0].get("message", {}).get("content", "")
+                    answer = _extract_text(data)
                     if not answer:
                         return web.json_response(
-                            {"error": "xAI вернул пустой ответ"}, status=502, headers=CORS_HEADERS
+                            {"error": "ИИ вернул пустой ответ"}, status=502, headers=CORS_HEADERS
                         )
                     save_history(user_id, work_type, answer)
                     asyncio.create_task(_send_new_token(user_id))
@@ -943,11 +1090,13 @@ async def handle_yukassa_webhook(request):
 
 async def run_web():
     app = web.Application()
-    app.router.add_get("/check_token",       handle_check_token)
+    app.router.add_get("/check_token",        handle_check_token)
     app.router.add_route("OPTIONS", "/check_token", handle_check_token)
-    app.router.add_post("/proxy",            handle_proxy)
+    app.router.add_post("/ocr",               handle_ocr)
+    app.router.add_route("OPTIONS", "/ocr",   handle_ocr)
+    app.router.add_post("/proxy",             handle_proxy)
     app.router.add_route("OPTIONS", "/proxy", handle_proxy)
-    app.router.add_post("/yukassa/webhook",  handle_yukassa_webhook)
+    app.router.add_post("/yukassa/webhook",   handle_yukassa_webhook)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
@@ -956,6 +1105,7 @@ async def run_web():
 
 async def main():
     init_db()
+    init_training_db()
     await run_web()
     if ENABLE_KEEPALIVE:
         asyncio.create_task(_keepalive_loop())
