@@ -40,6 +40,13 @@ RUB_1       = 27
 RUB_5       = 110
 RUB_MONTH   = 210
 
+# Ожидаемая сумма (RUB) по payload — для сверки реально оплаченного в вебхуке.
+YUKASSA_AMOUNTS = {
+    "rub_1":     RUB_1,
+    "rub_5":     RUB_5,
+    "rub_month": RUB_MONTH,
+}
+
 WHITELIST = {"champselyseee", "dilaiip", "riavlw", "ENOTINA0", "ssmatwikss"}
 
 CORS_HEADERS = {
@@ -332,6 +339,8 @@ def init_db():
         con.execute("""CREATE TABLE IF NOT EXISTS referrals (
             referrer_id INTEGER, referred_id INTEGER PRIMARY KEY,
             created_at INTEGER, rewarded INTEGER DEFAULT 0)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS processed_payments (
+            payment_id TEXT PRIMARY KEY, created_at INTEGER)""")
         try:
             con.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER DEFAULT NULL")
         except sqlite3.OperationalError:
@@ -480,6 +489,21 @@ def reward_referrer(referred_id):
         con.execute("UPDATE users SET paid_checks=paid_checks+1 WHERE user_id=?", (referrer_id,))
         con.commit()
     return referrer_id
+
+
+def mark_payment_processed(payment_id):
+    """Идемпотентность платежей: True — платёж новый (и помечен обработанным),
+    False — этот payment_id уже начислялся (повтор/replay вебхука)."""
+    with get_db() as con:
+        try:
+            con.execute(
+                "INSERT INTO processed_payments VALUES (?,?)",
+                (payment_id, int(time.time()))
+            )
+            con.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
 
 
 def save_history(user_id, work_type, result):
@@ -1111,6 +1135,25 @@ async def handle_proxy(request):
         return web.json_response({"error": str(e)}, status=500, headers=CORS_HEADERS)
 
 
+async def _fetch_yookassa_payment(payment_id):
+    """Перезапрашивает платёж у YooKassa по id для подтверждения подлинности
+    вебхука. Возвращает dict платежа или None (нет кредов / ошибка / не найден)."""
+    if not YUKASSA_SHOP_ID or not YUKASSA_SECRET:
+        return None
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                f"https://api.yookassa.ru/v3/payments/{payment_id}",
+                auth=aiohttp.BasicAuth(YUKASSA_SHOP_ID, YUKASSA_SECRET),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                if r.status != 200:
+                    return None
+                return await r.json()
+    except Exception:
+        return None
+
+
 async def handle_yukassa_webhook(request):
     try:
         body = await request.json()
@@ -1118,15 +1161,41 @@ async def handle_yukassa_webhook(request):
         return web.Response(status=400)
     if body.get("event") != "payment.succeeded":
         return web.Response(status=200)
-    obj = body.get("object", {})
-    meta = obj.get("metadata", {})
+
+    # БЕЗОПАСНОСТЬ: тело вебхука НЕ доверенное (эндпоинт публичный, подписи нет).
+    # Берём только id из тела и перезапрашиваем платёж у YooKassa; начисляем
+    # строго по подтверждённому объекту (статус/метаданные/сумма из ответа API).
+    incoming = body.get("object", {}) or {}
+    payment_id = incoming.get("id")
+    if not isinstance(payment_id, str) or not payment_id:
+        return web.Response(status=200)
+
+    payment = await _fetch_yookassa_payment(payment_id)
+    if not payment or payment.get("status") != "succeeded" or not payment.get("paid"):
+        return web.Response(status=200)
+
+    meta = payment.get("metadata", {}) or {}
     try:
         user_id = int(meta.get("user_id", 0))
     except (ValueError, TypeError):
         return web.Response(status=200)
     pl = meta.get("payload", "")
-    if not user_id or not pl:
+    if not user_id or pl not in YUKASSA_AMOUNTS:
         return web.Response(status=200)
+
+    # Сверяем реально оплаченную сумму/валюту с тарифом из payload.
+    amount = payment.get("amount", {}) or {}
+    try:
+        paid_value = float(amount.get("value", 0))
+    except (ValueError, TypeError):
+        return web.Response(status=200)
+    if amount.get("currency") != "RUB" or paid_value < YUKASSA_AMOUNTS[pl]:
+        return web.Response(status=200)
+
+    # Идемпотентность: один payment_id не начисляем дважды (replay вебхука).
+    if not mark_payment_processed(payment_id):
+        return web.Response(status=200)
+
     from telegram import Bot
     bot = Bot(token=TELEGRAM_TOKEN)
     referrer_id = reward_referrer(user_id)
