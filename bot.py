@@ -1106,6 +1106,71 @@ async def handle_proxy(request):
     if THINKING_MODE == "adaptive":
         create_kwargs["thinking"] = {"type": "adaptive"}
 
+    # Потоковый режим (фронт прислал "stream": true): держим соединение живым
+    # «пульсом» во время долгой генерации, в конце отдаём готовый результат.
+    # Без флага — старое поведение ниже (один JSON), для обратной совместимости.
+    if body.get("stream") is True:
+        resp = web.StreamResponse(
+            status=200,
+            headers={**CORS_HEADERS, "Content-Type": "application/x-ndjson; charset=utf-8"},
+        )
+        await resp.prepare(request)
+
+        async def _write_line(obj):
+            await resp.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+
+        async def _heartbeat():
+            # Пока модель «думает» (adaptive thinking) и текста ещё нет, всё равно
+            # шлём байты каждые 12 сек — соединение фронт↔бэк не рвётся в WebView.
+            try:
+                while True:
+                    await asyncio.sleep(12)
+                    await _write_line({"type": "ping"})
+            except (asyncio.CancelledError, ConnectionResetError):
+                pass
+
+        hb = asyncio.create_task(_heartbeat())
+        try:
+            async with ai_semaphore:
+                async with anthropic_client.messages.stream(**create_kwargs) as stream:
+                    message = await stream.get_final_message()
+            if message.stop_reason == "refusal":
+                kind, payload = "error", "Модель отклонила запрос"
+            else:
+                answer = _extract_text(message)
+                if not answer:
+                    kind, payload = "error", "ИИ вернул пустой ответ"
+                else:
+                    kind, payload = "done", answer
+        except anthropic.APITimeoutError:
+            kind, payload = "error", "Таймаут ответа от ИИ"
+        except anthropic.APIStatusError as e:
+            kind, payload = "error", f"Anthropic error: {str(e)[:200]}"
+        except Exception as e:
+            kind, payload = "error", str(e)
+        finally:
+            # Останавливаем «пульс» ПОЛНОСТЬЮ до финальной записи, чтобы строки
+            # NDJSON не наложились друг на друга.
+            hb.cancel()
+            try:
+                await hb
+            except BaseException:
+                pass
+
+        if kind == "done":
+            save_history(user_id, work_type, payload)
+            asyncio.create_task(_send_new_token(user_id))
+
+        try:
+            if kind == "done":
+                await _write_line({"type": "done", "answer": payload})
+            else:
+                await _write_line({"type": "error", "error": payload})
+            await resp.write_eof()
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        return resp
+
     try:
         async with ai_semaphore:
             # Стримим: соединение держится живым на время длинной генерации
@@ -1230,7 +1295,10 @@ async def handle_yukassa_webhook(request):
 
 
 async def run_web():
-    app = web.Application()
+    # Лимит размера тела запроса. По умолчанию aiohttp режет тело на 1 МБ, а фронт
+    # шлёт фото (base64) и файлы до 8 МБ — без этого большие работы обрывались
+    # ещё до обработки, и фронт показывал "load failed". 20 МБ даёт запас.
+    app = web.Application(client_max_size=20 * 1024 * 1024)
     app.router.add_get("/check_token",        handle_check_token)
     app.router.add_route("OPTIONS", "/check_token", handle_check_token)
     app.router.add_post("/ocr",               handle_ocr)
